@@ -16,7 +16,23 @@
 #include "platform.h"
 #include "vo.h"
 #include <argtable2.h>
+
+
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+
+//#define restrict
+//#include <libavcodec/ac3dec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/samplefmt.h>
+
+#ifdef HARDWARE_DECODE
+#include <fftools/ffmpeg.h>
+#endif
+
 #include "comskip.h"
+
 
 // Define detection methods
 #define BLACK_FRAME		1
@@ -451,6 +467,7 @@ int                     thread_count = 2;
 int                     hardware_decode = 0;
 int                     use_cuvid = 0;
 int                     use_vdpau = 0;
+int                     use_dxva2 = 0;
 int						skip_B_frames = 0;
 int						lowres = 0;
 bool					live_tv = false;
@@ -536,6 +553,7 @@ double              avg_fps = 22;
 
 int					border = 10;						// border around edge of video to ignore
 int					ticker_tape=0, ticker_tape_percentage=0;						// border from bottom to ignore
+int					top_ticker_tape=0, top_ticker_tape_percentage=0;						// border from bottom to ignore
 int					ignore_side=0;
 int					ignore_left_side=0;
 int					ignore_right_side=0;
@@ -2582,8 +2600,8 @@ void OutputDebugWindow(bool showVideo, int frm, int grf, bool forceRefresh)
             {
                 int comMkrX = ((postMarkerFrame - zstart)* owidth / v);
                 for (y = bartop; y < bartop+30 ; y++) SETPIXEL(comMkrX,y,0,0,255);
-            }    
-                
+            }
+
             for (y = bartop; y < bartop+(loadingTXT?20:5) ; y++)
             {
                 // Reference bar
@@ -3127,11 +3145,11 @@ bool ReviewResult()
             {
                 oldfrm = -1;
             }
-            
+
             if (key == 'J')
             {
                 // Handle the user setting the before marker frame.
-                preMarkerFrame = curframe;                
+                preMarkerFrame = curframe;
                 if (postMarkerFrame > 0 && preMarkerFrame > 0)
                 {
                     long midpoint = ((long)postMarkerFrame + (long)preMarkerFrame) / 2l;
@@ -3151,7 +3169,7 @@ bool ReviewResult()
                     long midpoint = ((long)postMarkerFrame + (long)preMarkerFrame) / 2l;
                     curframe = (int)midpoint;
                 }
-		
+
                 forceRefresh = true;
             }
 
@@ -3245,11 +3263,17 @@ int DetectCommercials(int f, double pts)
     {
         volumeHistogram[(curvolume/volumeScale < 255 ? curvolume/volumeScale : 255)]++;
     }
-    if (ticker_tape_percentage>0)
+    if (ticker_tape_percentage > 0)
         ticker_tape = ticker_tape_percentage * height / 100;
-    if (ticker_tape)
+    if (ticker_tape > 0 )
     {
         memset(&frame_ptr[width*(height - ticker_tape)], 0, width*ticker_tape);
+    }
+    if (top_ticker_tape_percentage > 0)
+        top_ticker_tape = top_ticker_tape_percentage * height / 100;
+    if (top_ticker_tape > 0 )
+    {
+        memset(&frame_ptr[0], 0, width*top_ticker_tape);
     }
     if (ignore_side)
     {
@@ -8558,6 +8582,8 @@ void LoadIniFile()
         if ((tmp = FindNumber(data, "logo_max_percentage_of_screen=", (double) logo_max_percentage_of_screen)) > -1) logo_max_percentage_of_screen = (double)tmp;
         if ((tmp = FindNumber(data, "ticker_tape=", (double) ticker_tape)) > -1) ticker_tape = (int)tmp;
         if ((tmp = FindNumber(data, "ticker_tape_percentage=", (double) ticker_tape_percentage)) > -1) ticker_tape_percentage = (int)tmp;
+        if ((tmp = FindNumber(data, "top_ticker_tape=", (double) top_ticker_tape)) > -1) top_ticker_tape = (int)tmp;
+        if ((tmp = FindNumber(data, "top_ticker_tape_percentage=", (double) top_ticker_tape_percentage)) > -1) top_ticker_tape_percentage = (int)tmp;
         if ((tmp = FindNumber(data, "ignore_side=", (double) ignore_side)) > -1) ignore_side = (int)tmp;
         if ((tmp = FindNumber(data, "ignore_left_side=", (double) ignore_left_side)) > -1) ignore_left_side = (int)tmp;
         if ((tmp = FindNumber(data, "ignore_right_side=", (double) ignore_right_side)) > -1) ignore_right_side = (int)tmp;
@@ -8736,6 +8762,7 @@ FILE* LoadSettings(int argc, char ** argv)
     struct arg_lit*		cl_hwassist				= arg_lit0(NULL, "hwassist", "Activate Hardware Assisted video decoding");
     struct arg_lit*		cl_use_cuvid			= arg_lit0(NULL, "cuvid", "Use NVIDIA Video Decoder (CUVID), if available");
     struct arg_lit*		cl_use_vdpau			= arg_lit0(NULL, "vdpau", "Use NVIDIA Video Decode and Presentation API (VDPAU), if available");
+    struct arg_lit*		cl_use_dxva2			= arg_lit0(NULL, "dxva2", "Use DXVA2 Video Decode and Presentation API (DXVA2), if available");
     struct arg_lit*		cl_list_decoders		= arg_lit0(NULL, "decoders", "List all decoders and exit");
     struct arg_int*		cl_threads				= arg_int0(NULL, "threads", "<int>", "The number of threads to use");
     struct arg_int*		cl_verbose				= arg_intn("v", "verbose", NULL, 0, 1, "Verbose level");
@@ -8765,6 +8792,7 @@ FILE* LoadSettings(int argc, char ** argv)
         cl_hwassist,
         cl_use_cuvid,
         cl_use_vdpau,
+        cl_use_dxva2,
         cl_list_decoders,
         cl_threads,
         cl_pid,
@@ -8849,11 +8877,11 @@ FILE* LoadSettings(int argc, char ** argv)
     }
 
     nerrors = arg_parse(argc, argv, argtable);
-    if (cl_list_decoders->count) 
+    if (cl_list_decoders->count)
     {
         list_codecs();
         exit(2);
-    }    
+    }
     if (cl_help->count)
     {
         printf("Usage:\n  comskip ");
@@ -9220,14 +9248,20 @@ FILE* LoadSettings(int argc, char ** argv)
     }
     if (cl_use_cuvid->count)
     {
-        printf("Enabling use_cuvid\n");        
+        printf("Enabling use_cuvid\n");
         use_cuvid = 1;
     }
     if (cl_use_vdpau->count)
     {
-        printf("Enabling use_vdpau\n");        
+        printf("Enabling use_vdpau\n");
         use_vdpau = 1;
-    }    
+    }
+
+    if (cl_use_dxva2->count)
+    {
+        printf("Enabling use_dxva2\n");
+        use_dxva2 = 1;
+    }
 
     if (cl_threads->count)
     {
@@ -9813,7 +9847,9 @@ void ProcessARInfo(int minY, int maxY, int minX, int maxX)
 
     if (ticker_tape_percentage>0)
         ticker_tape = ticker_tape_percentage * height / 100;
-    if (ticker_tape > 0 || (
+    if (top_ticker_tape_percentage>0)
+        top_ticker_tape = top_ticker_tape_percentage * height / 100;
+    if (ticker_tape != 0 || top_ticker_tape != 0 || (
                 abs((height - maxY) - (minY)) < 13 + (minY )/15  &&  // discard for no simetrical check
                 abs((videowidth  - maxX) - (minX)) < 13 + (minX )/15  &&  // discard for no simetrical check
                 minY < height / 4 &&
@@ -11616,7 +11652,7 @@ bool ProcessLogoTest(int framenum_real, int curLogoTest, int close)
                 logoTrendCounter = 0;
                 InitializeLogoBlockArray(logo_block_count + 2);
                 logo_block[logo_block_count + 1].start = -1;
-                logo_block[logo_block_count].start = framenum_real - ((int)(fps * logoFreq) * (minHitsForTrend - 1));
+                logo_block[logo_block_count].start = max(framenum_real - ((int)(fps * logoFreq) * (minHitsForTrend - 1)),0);
                 frames_with_logo +=((int)(fps * logoFreq) * (minHitsForTrend - 1));
                 if (framearray)
                 {
@@ -16212,19 +16248,22 @@ double get_fps()
 }
 
 
-void set_fps(double fp,double dfps, int ticks, double rfps, double afps)
+void set_fps(double fp)
 {
     double old_fps = fps;
-    static int showed_fps=0;
+    double new_fps = (double)1.0 / fp;
+//    static int showed_fps=0;
+ #ifdef notused
+
     static int fps_correction_count = 0;
-    fps = (double)1.0 / fp;
-    if (fps != old_fps)
-        showed_fps=0.0;
-    if (fabs(old_fps-fps) > 0.01 /* && showed_fps++ < 4 */ ) {
-        if (fps_correction_count++ > 4) {
+    if (fabs(old_fps-new_fps) > 0.01 /* && showed_fps++ < 4 */ ) {
+        if (fps_correction_count++ > 4 || old_fps == 1) {
+            fps = new_fps;
+            if (fps != old_fps)
+                showed_fps=0.0;
             Debug(1, "Frame Rate set to %5.3f f/s\n", fps);
             if (ticks > 1)
-                Debug(1, "Ticks per frame = %d\n", ticks);
+                Debug(1, "Repeats per frame = %d\n", ticks);
             if ((fabs(fps - dfps) > 0.1)) {
                 Debug(1, "DFps[%d]= %5.3f f/s\n", ticks, dfps);
             }
@@ -16234,19 +16273,21 @@ void set_fps(double fp,double dfps, int ticks, double rfps, double afps)
             if (fabs(fps - afps) > 0.1) {
                 Debug(1, "AFps[%d]= %5.3f f/s\n", ticks, afps);
             }
-            if ( fps < 9.0 || fps > 100 )
+#endif
+            if ( new_fps > 9.0 && new_fps < 150 && fabs(new_fps - fps) > 1. )
             {
-                fps = dfps;
-                if (/* old_fps != fps && */ showed_fps < 4)
-                    Debug(1, "Frame Rate corrected to %5.3f f/s\n", fps);
+                fps = new_fps;
+                Debug(1, "Frame Rate set to %5.3f f/s\n", fps);
+ //               if (/* old_fps != fps && */ showed_fps < 4)
+//                    Debug(1, "Frame Rate corrected to %5.3f f/s\n", fps);
             }
-
+/*
         }
 
     }
     else
         fps_correction_count = 0;
-
+*/
 
 }
 /* no longer used
